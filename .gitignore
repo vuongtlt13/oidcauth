@@ -1,0 +1,9 @@
+.idea/
+.vscode/
+.DS_Store
+*.test
+*.out
+go.work
+coverage.out
+coverage.html
+.env
