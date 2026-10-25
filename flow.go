@@ -21,11 +21,20 @@ import (
 // state value as additional data, so a cookie cannot be replayed for another
 // state.
 type flow struct {
-	State     string `json:"s"`
-	Nonce     string `json:"n"`
-	Verifier  string `json:"v"`
-	ReturnTo  string `json:"r,omitempty"`
-	ExpiresAt int64  `json:"e"`
+	State    string `json:"s"`
+	Nonce    string `json:"n"`
+	Verifier string `json:"v"`
+	ReturnTo string `json:"r,omitempty"`
+	// Scope is the space-separated scope sent, the fallback for the granted
+	// scope when the token response omits it (RFC 6749, section 5.1).
+	Scope string `json:"sc,omitempty"`
+	// IssuedAt is when the login started; max_age is measured from it.
+	IssuedAt int64 `json:"i"`
+	// MaxAge is the max_age sent, in seconds; auth_time is then required.
+	MaxAge *int64 `json:"m,omitempty"`
+	// ACR lists acr_values the ID token acr must match (Config.RequireACR).
+	ACR       []string `json:"a,omitempty"`
+	ExpiresAt int64    `json:"e"`
 }
 
 type flowCodec struct {
@@ -64,7 +73,9 @@ func (c *flowCodec) name(state string) string {
 	return c.prefix + "_" + hex.EncodeToString(sum[:6])
 }
 
-func (c *flowCodec) encode(f flow) (*http.Cookie, error) {
+// encode seals f. crossSitePost marks a form_post login: the provider POSTs
+// the callback cross-site, which a SameSite=Lax cookie does not survive.
+func (c *flowCodec) encode(f flow, crossSitePost bool) (*http.Cookie, error) {
 	f.ExpiresAt = c.now().Add(c.ttl).Unix()
 	plain, err := json.Marshal(f)
 	if err != nil {
@@ -75,7 +86,12 @@ func (c *flowCodec) encode(f flow) (*http.Cookie, error) {
 		return nil, fmt.Errorf("oidcauth: random: %w", err)
 	}
 	sealed := c.aead.Seal(nonce, nonce, plain, []byte(f.State))
-	return c.cookie(c.name(f.State), base64.RawURLEncoding.EncodeToString(sealed), int(c.ttl.Seconds())), nil
+	ck := c.cookie(c.name(f.State), base64.RawURLEncoding.EncodeToString(sealed), int(c.ttl.Seconds()))
+	if crossSitePost {
+		ck.SameSite = http.SameSiteNoneMode
+		ck.Secure = true // browsers drop SameSite=None cookies without Secure
+	}
+	return ck, nil
 }
 
 func (c *flowCodec) decode(state, value string) (*flow, error) {
@@ -107,8 +123,9 @@ func (c *flowCodec) clear(state string) *http.Cookie {
 	return ck
 }
 
-// cookie is HttpOnly and SameSite=Lax: Lax is required because the callback
-// is a top-level cross-site navigation from the provider back to the app.
+// cookie is HttpOnly and SameSite=Lax: Lax (not Strict) is required because
+// the callback is a top-level cross-site navigation from the provider back to
+// the app.
 func (c *flowCodec) cookie(name, value string, maxAge int) *http.Cookie {
 	return &http.Cookie{
 		Name:     name,

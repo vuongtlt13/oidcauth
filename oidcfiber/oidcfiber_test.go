@@ -89,6 +89,124 @@ func TestFiberLoginCallback(t *testing.T) {
 	}
 }
 
+func newFiberClient(t *testing.T, op *oidctest.Provider) *oidcauth.Client {
+	t.Helper()
+	client, err := oidcauth.New(oidcauth.Config{
+		Issuer:       op.Issuer(),
+		ClientID:     "c1",
+		ClientSecret: "s1",
+		RedirectURL:  "https://app.example.com/auth/callback",
+		CookieSecret: strings.Repeat("k", 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func TestFiberFormPostCallback(t *testing.T) {
+	op := oidctest.NewProvider(t, "c1", "s1")
+	client := newFiberClient(t, op)
+
+	var got *oidcauth.Result
+	app := fiber.New()
+	h := oidcfiber.New(client, oidcfiber.Options{
+		LoginOptions: func(*fiber.Ctx) []oidcauth.LoginOption {
+			return []oidcauth.LoginOption{oidcauth.WithResponseMode(oidcauth.ResponseModeFormPost)}
+		},
+		OnSuccess: func(c *fiber.Ctx, res *oidcauth.Result) error {
+			got = res
+			return c.SendStatus(fiber.StatusNoContent)
+		},
+	})
+	app.Get("/auth/login", h.Login)
+	app.Post("/auth/callback", h.Callback)
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/auth/login", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	flowCookie := findCookie(t, resp.Cookies(), "oidc_flow_")
+	if flowCookie.SameSite != http.SameSiteNoneMode || !flowCookie.Secure {
+		t.Fatalf("form_post flow cookie must be SameSite=None; Secure, got %+v", flowCookie)
+	}
+	location := resp.Header.Get("Location")
+	if mustQuery(t, location).Get("response_mode") != "form_post" {
+		t.Fatalf("auth url lacks response_mode=form_post: %s", location)
+	}
+	query := op.Authorize(t, location, oidctest.User{Subject: "u1"})
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/callback", strings.NewReader(query.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(&http.Cookie{Name: flowCookie.Name, Value: flowCookie.Value})
+	resp, err = app.Test(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != fiber.StatusNoContent || got == nil || got.Identity.Subject != "u1" {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("callback status = %d: %s", resp.StatusCode, body)
+	}
+}
+
+func TestFiberBackChannelLogout(t *testing.T) {
+	op := oidctest.NewProvider(t, "c1", "s1")
+	client := newFiberClient(t, op)
+
+	var ended []*oidcauth.LogoutToken
+	app := fiber.New()
+	h := oidcfiber.New(client, oidcfiber.Options{
+		OnSuccess: func(c *fiber.Ctx, _ *oidcauth.Result) error { return nil },
+	})
+	app.Post("/auth/backchannel-logout", h.BackChannelLogout(func(c *fiber.Ctx, lt *oidcauth.LogoutToken) error {
+		ended = append(ended, lt)
+		return nil
+	}))
+	post := func(token string) *http.Response {
+		t.Helper()
+		form := url.Values{}
+		if token != "" {
+			form.Set("logout_token", token)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/auth/backchannel-logout", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		resp, err := app.Test(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	resp := post(op.LogoutToken("u1", "sid-1", nil))
+	if resp.StatusCode != fiber.StatusOK || resp.Header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("status = %d, cache-control = %q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+	}
+	if len(ended) != 1 || ended[0].Subject != "u1" || ended[0].SessionID != "sid-1" {
+		t.Fatalf("ended = %+v", ended)
+	}
+	for name, token := range map[string]string{
+		"missing":  "",
+		"garbage":  "not-a-jwt",
+		"no event": op.LogoutToken("u1", "", func(c map[string]any) { delete(c, "events") }),
+	} {
+		if resp := post(token); resp.StatusCode != fiber.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", name, resp.StatusCode)
+		}
+	}
+	if len(ended) != 1 {
+		t.Fatalf("invalid tokens must not end sessions: %+v", ended)
+	}
+}
+
+func mustQuery(t *testing.T, raw string) url.Values {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Query()
+}
+
 func TestDefaultErrorHandler(t *testing.T) {
 	app := fiber.New()
 	app.Get("/user", func(c *fiber.Ctx) error { return oidcfiber.DefaultErrorHandler(c, oidcauth.ErrInvalidState) })

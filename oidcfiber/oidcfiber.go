@@ -12,9 +12,14 @@
 //	})
 //	app.Get("/api/v1/auth/oidc/login", h.Login)
 //	app.Get("/api/v1/auth/oidc/callback", h.Callback)
+//	app.Post("/api/v1/auth/oidc/callback", h.Callback) // only with response_mode=form_post
+//	app.Post("/api/v1/auth/oidc/backchannel-logout", h.BackChannelLogout(func(c *fiber.Ctx, t *oidcauth.LogoutToken) error {
+//		return sessions.EndProviderSession(c.UserContext(), t.Subject, t.SessionID)
+//	}))
 package oidcfiber
 
 import (
+	"errors"
 	"net/http"
 	"net/url"
 
@@ -74,9 +79,10 @@ func (h *Handler) Login(c *fiber.Ctx) error {
 	return c.Redirect(authURL, fiber.StatusFound)
 }
 
-// Callback completes the login and calls OnSuccess or OnError.
+// Callback completes the login and calls OnSuccess or OnError. Mount it on GET
+// (response_mode=query) and, when ResponseModeFormPost is used, on POST too.
 func (h *Handler) Callback(c *fiber.Ctx) error {
-	query := QueryValues(c)
+	query := CallbackValues(c)
 	state := query.Get("state")
 	c.Set(fiber.HeaderCacheControl, "no-store")
 	if state != "" {
@@ -93,6 +99,36 @@ func (h *Handler) Callback(c *fiber.Ctx) error {
 	return h.opts.OnSuccess(c, res)
 }
 
+// BackChannelLogout returns a handler for the back-channel logout URI
+// registered at the provider (OpenID Connect Back-Channel Logout 1.0). It
+// verifies the POSTed `logout_token` and calls onLogout, which ends the app
+// sessions of LogoutToken.Subject and/or LogoutToken.SessionID. It answers
+// 200 on success, 400 for an invalid token and 501 when onLogout fails (the
+// spec's error status), always with Cache-Control: no-store.
+func (h *Handler) BackChannelLogout(onLogout func(c *fiber.Ctx, t *oidcauth.LogoutToken) error) fiber.Handler {
+	if onLogout == nil {
+		panic("oidcfiber: BackChannelLogout needs onLogout")
+	}
+	return func(c *fiber.Ctx) error {
+		c.Set(fiber.HeaderCacheControl, "no-store")
+		raw := c.FormValue("logout_token")
+		if raw == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_request"})
+		}
+		token, err := h.client.VerifyLogoutToken(c.UserContext(), raw)
+		if err != nil {
+			if errors.Is(err, oidcauth.ErrInvalidLogoutToken) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid_request"})
+			}
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "temporarily_unavailable"})
+		}
+		if err := onLogout(c, token); err != nil {
+			return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "logout_failed"})
+		}
+		return c.SendStatus(fiber.StatusOK)
+	}
+}
+
 // DefaultErrorHandler answers 401 for login failures and 502 when the
 // provider cannot be reached, without leaking internal details.
 func DefaultErrorHandler(c *fiber.Ctx, err error) error {
@@ -105,6 +141,19 @@ func DefaultErrorHandler(c *fiber.Ctx, err error) error {
 // QueryValues converts the request query string to url.Values.
 func QueryValues(c *fiber.Ctx) url.Values {
 	values, _ := url.ParseQuery(string(c.Request().URI().QueryString()))
+	return values
+}
+
+// CallbackValues returns the authorization response parameters: the query
+// string, or the form body of a POST (response_mode=form_post).
+func CallbackValues(c *fiber.Ctx) url.Values {
+	if c.Method() != fiber.MethodPost {
+		return QueryValues(c)
+	}
+	values := url.Values{}
+	c.Request().PostArgs().VisitAll(func(k, v []byte) {
+		values.Add(string(k), string(v))
+	})
 	return values
 }
 

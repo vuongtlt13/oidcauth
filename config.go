@@ -16,8 +16,21 @@ const (
 	minCookieSecret   = 32
 )
 
+// Token endpoint client authentication methods (OpenID Connect Core 1.0,
+// section 9). Config.TokenEndpointAuthMethod selects one.
+const (
+	// AuthMethodAuto picks client_secret_basic, falling back to
+	// client_secret_post, for a client with a secret; private_key_jwt for a
+	// client with ClientKey; none for a public client.
+	AuthMethodAuto              = ""
+	AuthMethodClientSecretBasic = "client_secret_basic"
+	AuthMethodClientSecretPost  = "client_secret_post"
+	AuthMethodPrivateKeyJWT     = "private_key_jwt"
+	AuthMethodNone              = "none"
+)
+
 // DefaultScopes is used when Config.Scopes is empty.
-var DefaultScopes = []string{"openid", "profile", "email"}
+var DefaultScopes = []string{ScopeOpenID, ScopeProfile, ScopeEmail}
 
 // Config describes one OpenID Connect relying party (your app) registered at
 // one OpenID Provider (Zitadel, Keycloak, Google, ...).
@@ -25,14 +38,39 @@ type Config struct {
 	// Issuer is the provider issuer URL, e.g. https://id.example.com. It must
 	// match the `issuer` in the discovery document exactly.
 	Issuer string
-	// ClientID and ClientSecret of the app registered at the provider. Leave
-	// ClientSecret empty for a public client (PKCE only).
-	ClientID     string
+	// DiscoveryURL overrides <Issuer>/.well-known/openid-configuration.
+	DiscoveryURL string
+	// ClientID of the app registered at the provider.
+	ClientID string
+	// ClientSecret for client_secret_basic / client_secret_post. Leave it
+	// and ClientKey empty for a public client (PKCE only).
 	ClientSecret string
+	// ClientKey is a PEM private key (RSA or EC) for private_key_jwt client
+	// authentication, with ClientKeyID as its `kid`. For Zitadel, take `key`
+	// and `keyId` from the application key JSON. Mutually exclusive with
+	// ClientSecret.
+	ClientKey   []byte
+	ClientKeyID string
+	// TokenEndpointAuthMethod forces one client authentication method.
+	// Defaults to AuthMethodAuto.
+	TokenEndpointAuthMethod string
 	// RedirectURL is the absolute callback URL registered at the provider.
 	RedirectURL string
-	// Scopes requested at the authorization endpoint. Defaults to DefaultScopes.
+	// Scopes requested at the authorization endpoint. Defaults to
+	// DefaultScopes. Must include ScopeOpenID.
 	Scopes []string
+
+	// ACRValues are sent as `acr_values` on every login (requested
+	// authentication context classes, e.g. a MFA level). Per-request
+	// WithACRValues overrides them.
+	ACRValues []string
+	// RequireACR rejects a login whose ID token `acr` is not one of the
+	// requested acr_values. Without it acr_values is only a hint.
+	RequireACR bool
+	// MaxAge is sent as `max_age` on every login when positive: the provider
+	// must re-authenticate a user whose last authentication is older, and the
+	// ID token `auth_time` is then checked. Per-request WithMaxAge overrides it.
+	MaxAge time.Duration
 
 	// CookieSecret signs and encrypts the short-lived login flow cookie that
 	// carries state, nonce and the PKCE verifier. At least 32 characters.
@@ -60,7 +98,8 @@ type Config struct {
 
 	// PostLogoutRedirectURL is the default target after RP-initiated logout.
 	PostLogoutRedirectURL string
-	// HTTPClient is used for discovery, JWKS, token and userinfo requests.
+	// HTTPClient is used for discovery, JWKS, token, userinfo and revocation
+	// requests.
 	HTTPClient *http.Client
 }
 
@@ -95,6 +134,11 @@ func (c Config) Validate() error {
 	if err := validateAbsoluteURL("issuer", c.Issuer); err != nil {
 		errs = append(errs, err)
 	}
+	if c.DiscoveryURL != "" {
+		if err := validateAbsoluteURL("discovery url", c.DiscoveryURL); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if strings.TrimSpace(c.ClientID) == "" {
 		errs = append(errs, errors.New("client id is required"))
 	}
@@ -104,8 +148,37 @@ func (c Config) Validate() error {
 	if len(c.CookieSecret) < minCookieSecret {
 		errs = append(errs, fmt.Errorf("cookie secret must be at least %d characters", minCookieSecret))
 	}
-	if len(c.Scopes) > 0 && !containsString(c.Scopes, "openid") {
+	if len(c.Scopes) > 0 && !containsString(c.Scopes, ScopeOpenID) {
 		errs = append(errs, errors.New(`scopes must include "openid"`))
+	}
+	if c.ClientSecret != "" && len(c.ClientKey) > 0 {
+		errs = append(errs, errors.New("set either client secret or client key, not both"))
+	}
+	if len(c.ClientKey) > 0 && c.ClientKeyID == "" {
+		errs = append(errs, errors.New("client key id is required with client key"))
+	}
+	switch c.TokenEndpointAuthMethod {
+	case AuthMethodAuto:
+	case AuthMethodClientSecretBasic, AuthMethodClientSecretPost:
+		if c.ClientSecret == "" {
+			errs = append(errs, fmt.Errorf("%s requires a client secret", c.TokenEndpointAuthMethod))
+		}
+	case AuthMethodPrivateKeyJWT:
+		if len(c.ClientKey) == 0 {
+			errs = append(errs, errors.New("private_key_jwt requires a client key"))
+		}
+	case AuthMethodNone:
+		if c.ClientSecret != "" || len(c.ClientKey) > 0 {
+			errs = append(errs, errors.New("auth method none must not have client credentials"))
+		}
+	default:
+		errs = append(errs, fmt.Errorf("unsupported token endpoint auth method %q", c.TokenEndpointAuthMethod))
+	}
+	if c.MaxAge < 0 {
+		errs = append(errs, errors.New("max age must not be negative"))
+	}
+	if c.RequireACR && len(c.ACRValues) == 0 {
+		errs = append(errs, errors.New("require acr needs acr values"))
 	}
 	return errors.Join(errs...)
 }

@@ -7,20 +7,18 @@
 // the identity (link, provision, reject) and how to keep the user signed in is
 // the application's decision.
 //
-// See the fiber sub-package for a ready-made Fiber adapter.
+// See the oidcfiber sub-package for a ready-made Fiber adapter.
 package oidcauth
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
-	"strings"
 	"sync"
+	"time"
 
+	"github.com/zitadel/oidc/v3/pkg/client"
 	"github.com/zitadel/oidc/v3/pkg/client/rp"
 	"github.com/zitadel/oidc/v3/pkg/oidc"
 	"golang.org/x/oauth2"
@@ -32,11 +30,14 @@ var (
 	ErrInvalidState = errors.New("oidcauth: invalid or expired login state")
 	// ErrMissingCode means the callback carries neither a code nor an error.
 	ErrMissingCode = errors.New("oidcauth: authorization code missing")
+	// ErrNotSupported means the provider does not advertise the endpoint the
+	// operation needs (revocation, end session).
+	ErrNotSupported = errors.New("oidcauth: not supported by the provider")
 )
 
 // ProviderError is an error returned by the provider at the callback
 // (`error`/`error_description` parameters), e.g. access_denied when the user
-// has no grant for the project.
+// has no grant for the project, or login_required after prompt=none.
 type ProviderError struct {
 	Code        string
 	Description string
@@ -51,30 +52,47 @@ func (e *ProviderError) Error() string {
 
 // IsUserError reports whether err is caused by the browser/user side of the
 // flow (bad or expired state, provider-reported error such as access_denied,
-// missing code, rejected code or token) rather than the provider being
-// unreachable. Handlers typically map it to 401 versus 502.
+// missing code, rejected code, token or refresh token, failed auth_time/acr
+// check) rather than the provider being unreachable. Handlers typically map
+// it to 401 versus 502.
 func IsUserError(err error) bool {
 	var pe *ProviderError
-	var ce *exchangeError
+	var te *tokenError
 	return errors.Is(err, ErrInvalidState) || errors.Is(err, ErrMissingCode) ||
-		errors.As(err, &pe) || errors.As(err, &ce)
+		errors.As(err, &pe) || errors.As(err, &te)
 }
 
-// exchangeError wraps a rejected code exchange or invalid ID token.
-type exchangeError struct{ err error }
+// tokenError wraps a token response the provider or this library rejected:
+// invalid_grant, an invalid ID token, a failed auth_time or acr check.
+type tokenError struct {
+	op  string
+	err error
+}
 
-func (e *exchangeError) Error() string { return "oidcauth: code exchange failed: " + e.err.Error() }
-func (e *exchangeError) Unwrap() error { return e.err }
+func (e *tokenError) Error() string { return "oidcauth: " + e.op + " failed: " + e.err.Error() }
+func (e *tokenError) Unwrap() error { return e.err }
+
+// classify separates network failures (provider unreachable) from rejected
+// requests.
+func classify(op string, err error) error {
+	var netErr *url.Error
+	if errors.As(err, &netErr) {
+		return fmt.Errorf("oidcauth: %s: provider unreachable: %w", op, err)
+	}
+	return &tokenError{op: op, err: err}
+}
 
 // Client is safe for concurrent use. Provider discovery happens lazily on the
-// first login (and is retried until it succeeds), so an unreachable provider
+// first use (and is retried until it succeeds), so an unreachable provider
 // never prevents the application from starting; local login keeps working.
 type Client struct {
 	cfg   Config
 	flows *flowCodec
 
-	mu sync.Mutex
-	rp rp.RelyingParty
+	mu        sync.Mutex
+	rp        rp.RelyingParty
+	refreshRP rp.RelyingParty
+	discovery *oidc.DiscoveryConfiguration
 }
 
 type nonceKey struct{}
@@ -97,258 +115,105 @@ func (c *Client) Init(ctx context.Context) error {
 	return err
 }
 
+// Discovery returns the provider metadata (OpenID Connect Discovery 1.0),
+// e.g. to check scopes_supported or backchannel_logout_supported.
+func (c *Client) Discovery(ctx context.Context) (*oidc.DiscoveryConfiguration, error) {
+	if _, err := c.relyingParty(ctx); err != nil {
+		return nil, err
+	}
+	return c.discovery, nil
+}
+
+// authMethod resolves AuthMethodAuto from the configured credentials.
+func (c *Client) authMethod() string {
+	if c.cfg.TokenEndpointAuthMethod != AuthMethodAuto {
+		return c.cfg.TokenEndpointAuthMethod
+	}
+	switch {
+	case len(c.cfg.ClientKey) > 0:
+		return AuthMethodPrivateKeyJWT
+	case c.cfg.ClientSecret == "":
+		return AuthMethodNone
+	}
+	return AuthMethodAuto
+}
+
 func (c *Client) relyingParty(ctx context.Context) (rp.RelyingParty, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.rp != nil {
 		return c.rp, nil
 	}
-	party, err := rp.NewRelyingPartyOIDC(ctx,
-		c.cfg.Issuer, c.cfg.ClientID, c.cfg.ClientSecret, c.cfg.RedirectURL, c.cfg.Scopes,
-		rp.WithHTTPClient(c.cfg.HTTPClient),
-		rp.WithVerifierOpts(rp.WithNonce(func(ctx context.Context) string {
-			nonce, _ := ctx.Value(nonceKey{}).(string)
-			return nonce
-		})),
-		rp.WithSigningAlgsFromDiscovery(),
-	)
+	discovery, err := client.Discover(ctx, c.cfg.Issuer, c.cfg.HTTPClient, c.cfg.DiscoveryURL)
 	if err != nil {
 		return nil, fmt.Errorf("oidcauth: provider discovery failed: %w", err)
 	}
-	c.rp = party
+	party, err := c.newParty(ctx, c.cfg.Scopes, func(ctx context.Context) string {
+		nonce, _ := ctx.Value(nonceKey{}).(string)
+		return nonce
+	})
+	if err != nil {
+		return nil, err
+	}
+	c.rp, c.discovery = party, discovery
 	return party, nil
 }
 
-// LoginOption customises one authorization request.
-type LoginOption func(*loginOptions)
-
-type loginOptions struct {
-	returnTo    string
-	prompt      []string
-	loginHint   string
-	extraScopes []string
-	params      map[string]string
-}
-
-// WithReturnTo stores an application value (usually a relative path to go back
-// to) in the flow cookie; it is handed back by Finish. Sanitize it with
-// SafeReturnTo before redirecting.
-func WithReturnTo(v string) LoginOption { return func(o *loginOptions) { o.returnTo = v } }
-
-// WithPrompt sets `prompt` (e.g. "login", "select_account", "create").
-func WithPrompt(p ...string) LoginOption { return func(o *loginOptions) { o.prompt = p } }
-
-// WithLoginHint pre-fills the provider login form.
-func WithLoginHint(hint string) LoginOption { return func(o *loginOptions) { o.loginHint = hint } }
-
-// WithExtraScopes appends scopes for this request only, e.g. the Zitadel
-// `urn:zitadel:iam:org:id:<org>` scope to pin the login to one organization.
-func WithExtraScopes(s ...string) LoginOption {
-	return func(o *loginOptions) { o.extraScopes = append(o.extraScopes, s...) }
-}
-
-// WithParam adds a custom authorization request parameter.
-func WithParam(key, value string) LoginOption {
-	return func(o *loginOptions) {
-		if o.params == nil {
-			o.params = map[string]string{}
-		}
-		o.params[key] = value
+// refreshParty is a second relying party for the refresh_token grant. It
+// sends no `scope`, so the refreshed grant keeps the originally granted scopes
+// (RFC 6749, section 6), and it does not check `nonce`: a refreshed ID token
+// carries the nonce of the original login, which the app does not keep.
+func (c *Client) refreshParty(ctx context.Context) (rp.RelyingParty, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.refreshRP != nil {
+		return c.refreshRP, nil
 	}
-}
-
-// Start begins a login. The caller must set the returned cookie on the
-// response and redirect the browser to authURL.
-func (c *Client) Start(ctx context.Context, opts ...LoginOption) (authURL string, cookie *http.Cookie, err error) {
-	party, err := c.relyingParty(ctx)
-	if err != nil {
-		return "", nil, err
-	}
-	var o loginOptions
-	for _, opt := range opts {
-		opt(&o)
-	}
-
-	f := flow{
-		State:    randomToken(),
-		Nonce:    randomToken(),
-		Verifier: oauth2.GenerateVerifier(),
-		ReturnTo: o.returnTo,
-	}
-	cookie, err = c.flows.encode(f)
-	if err != nil {
-		return "", nil, err
-	}
-
-	params := []oauth2.AuthCodeOption{oauth2.SetAuthURLParam("nonce", f.Nonce)}
-	if len(o.prompt) > 0 {
-		params = append(params, oauth2.SetAuthURLParam("prompt", strings.Join(o.prompt, " ")))
-	}
-	if o.loginHint != "" {
-		params = append(params, oauth2.SetAuthURLParam("login_hint", o.loginHint))
-	}
-	if len(o.extraScopes) > 0 {
-		scopes := append(append([]string(nil), c.cfg.Scopes...), o.extraScopes...)
-		params = append(params, oauth2.SetAuthURLParam("scope", strings.Join(scopes, " ")))
-	}
-	for k, v := range o.params {
-		params = append(params, oauth2.SetAuthURLParam(k, v))
-	}
-	authURL = rp.AuthURL(f.State, party,
-		rp.WithCodeChallenge(oidc.NewSHACodeChallenge(f.Verifier)),
-		func() []oauth2.AuthCodeOption { return params },
-	)
-	return authURL, cookie, nil
-}
-
-// Result is a verified login.
-type Result struct {
-	Identity *Identity
-	// ReturnTo is the value passed with WithReturnTo, unsanitized.
-	ReturnTo string
-}
-
-// Finish completes a login from the callback query and the flow cookie value
-// (looked up with CookieNameFor(query.Get("state"))). The caller must always
-// set ClearCookie(state) on the response, whatever the outcome.
-//
-// It verifies state, exchanges the code with the PKCE verifier, validates the
-// ID token (signature via JWKS, iss, aud, azp, exp, iat, nonce, at_hash) and,
-// unless SkipUserInfo is set, merges userinfo claims.
-func (c *Client) Finish(ctx context.Context, query url.Values, cookieValue string) (*Result, error) {
-	state := query.Get("state")
-	if state == "" || cookieValue == "" {
-		return nil, ErrInvalidState
-	}
-	f, err := c.flows.decode(state, cookieValue)
+	party, err := c.newParty(ctx, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	if code := query.Get("error"); code != "" {
-		return nil, &ProviderError{Code: code, Description: query.Get("error_description")}
-	}
-	code := query.Get("code")
-	if code == "" {
-		return nil, ErrMissingCode
-	}
-
-	party, err := c.relyingParty(ctx)
-	if err != nil {
-		return nil, err
-	}
-	ctx = context.WithValue(ctx, nonceKey{}, f.Nonce)
-	tokens, err := rp.CodeExchange[*oidc.IDTokenClaims](ctx, code, party, rp.WithCodeVerifier(f.Verifier))
-	if err != nil {
-		var netErr *url.Error
-		if errors.As(err, &netErr) {
-			return nil, fmt.Errorf("oidcauth: token endpoint unreachable: %w", err)
-		}
-		return nil, &exchangeError{err: err}
-	}
-
-	claims, err := jwtPayload(tokens.IDToken)
-	if err != nil {
-		return nil, err
-	}
-	if !c.cfg.SkipUserInfo && party.UserinfoEndpoint() != "" {
-		info, err := rp.Userinfo[*oidc.UserInfo](ctx, tokens.AccessToken, tokens.TokenType, tokens.IDTokenClaims.GetSubject(), party)
-		if err != nil {
-			return nil, fmt.Errorf("oidcauth: userinfo failed: %w", err)
-		}
-		if err := mergeUserInfo(claims, info); err != nil {
-			return nil, err
-		}
-	}
-
-	identity := identityFromClaims(claims, c.cfg.RoleExtractor)
-	identity.Tokens = Tokens{
-		IDToken:      tokens.IDToken,
-		AccessToken:  tokens.AccessToken,
-		RefreshToken: tokens.RefreshToken,
-		TokenType:    tokens.TokenType,
-		Expiry:       tokens.Expiry,
-	}
-	return &Result{Identity: identity, ReturnTo: f.ReturnTo}, nil
+	c.refreshRP = party
+	return party, nil
 }
 
-// CookieNameFor returns the flow cookie name for a callback state.
-func (c *Client) CookieNameFor(state string) string { return c.flows.name(state) }
-
-// ClearCookie returns a cookie that deletes the flow cookie of state.
-func (c *Client) ClearCookie(state string) *http.Cookie { return c.flows.clear(state) }
-
-// LogoutURL builds the RP-initiated logout URL (end_session_endpoint). It
-// returns "" when the provider does not advertise one. postLogoutRedirect must
-// be registered at the provider; empty uses Config.PostLogoutRedirectURL.
-func (c *Client) LogoutURL(ctx context.Context, idTokenHint, postLogoutRedirect, state string) (string, error) {
-	party, err := c.relyingParty(ctx)
+func (c *Client) newParty(ctx context.Context, scopes []string, nonce func(context.Context) string) (rp.RelyingParty, error) {
+	opts := []rp.Option{
+		rp.WithHTTPClient(c.cfg.HTTPClient),
+		rp.WithVerifierOpts(rp.WithNonce(nonce)),
+		rp.WithSigningAlgsFromDiscovery(),
+	}
+	if c.cfg.DiscoveryURL != "" {
+		opts = append(opts, rp.WithCustomDiscoveryUrl(c.cfg.DiscoveryURL))
+	}
+	switch c.authMethod() {
+	case AuthMethodClientSecretBasic:
+		opts = append(opts, rp.WithAuthStyle(oauth2.AuthStyleInHeader))
+	case AuthMethodClientSecretPost, AuthMethodNone:
+		opts = append(opts, rp.WithAuthStyle(oauth2.AuthStyleInParams))
+	case AuthMethodPrivateKeyJWT:
+		opts = append(opts,
+			rp.WithAuthStyle(oauth2.AuthStyleInParams),
+			rp.WithJWTProfile(rp.SignerFromKeyAndKeyID(c.cfg.ClientKey, c.cfg.ClientKeyID)),
+		)
+	}
+	party, err := rp.NewRelyingPartyOIDC(ctx,
+		c.cfg.Issuer, c.cfg.ClientID, c.cfg.ClientSecret, c.cfg.RedirectURL, scopes, opts...)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("oidcauth: provider discovery failed: %w", err)
 	}
-	endpoint := party.GetEndSessionEndpoint()
-	if endpoint == "" {
-		return "", nil
-	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return "", fmt.Errorf("oidcauth: invalid end_session_endpoint: %w", err)
-	}
-	q := u.Query()
-	q.Set("client_id", c.cfg.ClientID)
-	if idTokenHint != "" {
-		q.Set("id_token_hint", idTokenHint)
-	}
-	if postLogoutRedirect == "" {
-		postLogoutRedirect = c.cfg.PostLogoutRedirectURL
-	}
-	if postLogoutRedirect != "" {
-		q.Set("post_logout_redirect_uri", postLogoutRedirect)
-	}
-	if state != "" {
-		q.Set("state", state)
-	}
-	u.RawQuery = q.Encode()
-	return u.String(), nil
+	return party, nil
 }
 
-// jwtPayload decodes the claims of an already verified JWT.
-func jwtPayload(token string) (map[string]any, error) {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return nil, errors.New("oidcauth: malformed id_token")
+// clientAssertion returns the token endpoint options for private_key_jwt
+// (RFC 7523); none for the other methods.
+func (c *Client) clientAssertion(party rp.RelyingParty) ([]rp.CodeExchangeOpt, error) {
+	if party.Signer() == nil {
+		return nil, nil
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	assertion, err := client.SignedJWTProfileAssertion(c.cfg.ClientID, []string{c.cfg.Issuer}, time.Minute, party.Signer())
 	if err != nil {
-		return nil, fmt.Errorf("oidcauth: malformed id_token payload: %w", err)
+		return nil, fmt.Errorf("oidcauth: sign client assertion: %w", err)
 	}
-	claims := map[string]any{}
-	if err := json.Unmarshal(raw, &claims); err != nil {
-		return nil, fmt.Errorf("oidcauth: malformed id_token payload: %w", err)
-	}
-	return claims, nil
-}
-
-// protectedClaims come from the verified ID token and are never overridden by
-// userinfo.
-var protectedClaims = map[string]struct{}{
-	"iss": {}, "sub": {}, "aud": {}, "azp": {}, "exp": {}, "iat": {}, "nbf": {},
-	"nonce": {}, "auth_time": {}, "at_hash": {}, "c_hash": {}, "sid": {}, "jti": {},
-}
-
-func mergeUserInfo(claims map[string]any, info *oidc.UserInfo) error {
-	raw, err := json.Marshal(info)
-	if err != nil {
-		return fmt.Errorf("oidcauth: encode userinfo: %w", err)
-	}
-	extra := map[string]any{}
-	if err := json.Unmarshal(raw, &extra); err != nil {
-		return fmt.Errorf("oidcauth: decode userinfo: %w", err)
-	}
-	for k, v := range extra {
-		if _, ok := protectedClaims[k]; ok {
-			continue
-		}
-		claims[k] = v
-	}
-	return nil
+	return []rp.CodeExchangeOpt{rp.WithClientAssertionJWT(assertion)}, nil
 }
