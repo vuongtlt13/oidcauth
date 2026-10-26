@@ -44,7 +44,7 @@ Cột "Biến env" là quy ước của backend template; app khác có thể đ
 | `TokenEndpointAuthMethod` | — | Mặc định tự chọn; chỉ đặt khi cần ép một phương thức |
 | `RedirectURL` | `AUTH_OIDC_REDIRECT_URL` | URL tuyệt đối của callback, phải đăng ký ở provider |
 | `Scopes` | `AUTH_OIDC_SCOPES` | Mặc định `openid profile email`, cách nhau bởi dấu cách |
-| — (`WithExtraScopes`) | `AUTH_OIDC_<KEY>_EXTRA_SCOPES` | Scope thêm cho một nút login, vd. `urn:zitadel:iam:org:id:<org>` |
+| — (`WithExtraScopes`) | `AUTH_OIDC_EXTRA_SCOPES`, `AUTH_OIDC_<KEY>_EXTRA_SCOPES` | Scope thêm cho một nút login, vd. `urn:zitadel:iam:org:id:<org>` |
 | — (`WithParam`) | `AUTH_OIDC_<KEY>_PARAMS` | Tham số authorize thêm, dạng `k:v,k:v` (vd. `hd:example.com`) |
 | `ACRValues`, `RequireACR`, `MaxAge` | — | Yêu cầu mức xác thực / đăng nhập lại; xem README thư viện |
 | `CookieSecret` | `AUTH_OIDC_COOKIE_SECRET` | ≥ 32 ký tự: `openssl rand -base64 32`. Đổi giá trị chỉ làm hỏng các login đang dở |
