@@ -38,6 +38,13 @@ rewrites:
 - A **Fiber v2 adapter** (`oidcfiber`) and an in-process **fake provider**
   (`oidctest`) for end-to-end tests.
 
+The core packages (`oidcauth`, `oidcfiber`, `oidctest`) work with any OpenID
+Connect provider: Zitadel, Keycloak, Google, Microsoft Entra ID, Auth0,
+Authentik, and others. The only Zitadel-aware default is the roles claim,
+and `RoleExtractor` overrides it. The optional `zitadel` packages (see
+[Zitadel identity provider login](#zitadel-identity-provider-login-without-zitadels-pages))
+are Zitadel-only.
+
 `oidcauth` deliberately does **not** do the following. Each application
 decides them:
 
@@ -50,6 +57,18 @@ decides them:
 ```bash
 go get github.com/vuongtlt13/oidcauth
 ```
+
+## Documentation
+
+Step-by-step guides (Vietnamese) are in [`docs/`](docs/README.md):
+
+- [Setup](docs/setup.md): wiring, `Config` ↔ environment variables,
+  `TicketStore`, cookies, local development, production checklist.
+- [Zitadel](docs/zitadel/README.md): web application (secret, Private Key
+  JWT, PKCE), roles and organizations, Google through Zitadel with or without
+  Zitadel's pages, logout and account linking, troubleshooting.
+- [Other providers](docs/providers.md): Google direct, Keycloak, Microsoft
+  Entra ID, Auth0.
 
 ## Usage with Fiber
 
@@ -182,10 +201,83 @@ providers you trust to verify email.
 ## Zitadel notes
 
 - Roles arrive in `urn:zitadel:iam:org:project:roles` once the project has
-  **"Assert Roles on Authentication"** enabled. Turn on **"Check authorization
-  on Authentication"** to block users without a grant.
+  **"Return user roles during authentication"** enabled. Turn on **"Only
+  authorized users can authenticate"** to block users without a role
+  assignment.
 - To pin login to one organization, use
   `oidcauth.WithExtraScopes("urn:zitadel:iam:org:id:<orgId>")`.
+
+## Zitadel identity provider login without Zitadel's pages
+
+The `zitadel` and `zitadel/zitadelfiber` packages are optional and
+**Zitadel-only**. With them, a "Sign in with Google" button can log in to
+Zitadel without Zitadel's login UI: the browser only sees Google's page. The
+app plays Zitadel's login UI through the v2 API, the way Login V2 does.
+
+```text
+GET  /auth/google/login                  zitadelfiber.Handler.Login
+     server side: authorize (not followed) → auth request V2_…
+                  POST /v2/idp_intents → Google URL
+  → Google → Zitadel /idps/callback
+  → GET /auth/google/idp/callback?rq=…   zitadelfiber.Handler.Callback
+     RetrieveIntent → find / auto-link / auto-create the user
+     POST /v2/sessions → POST /v2/oidc/auth_requests/{id}
+  → GET <RedirectURL>?code=…             oidcfiber.Handler.Callback (state, nonce, PKCE)
+```
+
+The result is a regular Zitadel login of the same client: same issuer,
+subject, roles and back-channel logout.
+
+```go
+api := zitadel.New(client.Config().Issuer, os.Getenv("ZITADEL_SERVICE_PAT"), nil)
+idp := zitadelfiber.New(client, zitadel.NewIDPLogin(api, googleIDPID), zitadelfiber.Options{
+	Tickets:     tickets, // the same TicketStore as the login tickets is fine
+	CallbackURL: "https://api.example.com/auth/google/idp/callback",
+	LoginOptions: func(c *fiber.Ctx) []oidcauth.LoginOption {
+		return []oidcauth.LoginOption{oidcauth.WithExtraScopes("urn:zitadel:iam:org:id:" + orgID)}
+	},
+	OnError: func(c *fiber.Ctx, err error) error {
+		switch {
+		case errors.Is(err, zitadel.ErrNotLinked): // no user, no auto-link/creation
+		case errors.Is(err, zitadel.ErrMFARequired): // org forces MFA for external logins
+		}
+		return c.Redirect("/login?error=...")
+	},
+})
+app.Get("/auth/google/login", idp.Login)
+app.Get("/auth/google/idp/callback", idp.Callback)
+// The code still arrives at the client's callback (oidcfiber), with OnSuccess as usual.
+```
+
+- **Service user**: a Zitadel service user with the *instance* role
+  `IAM_LOGIN_CLIENT` and a personal access token.
+- **Who can log in** follows the IdP options in Zitadel:
+  - an already linked account;
+  - *auto-linking* by verified email (exactly one matching user) or by
+    username, if the user's org allows external IdPs and offers this IdP for
+    linking;
+  - *auto-creation* (needs given and family name) into the org of the
+    `urn:zitadel:iam:org:id:` scope, or else the default org.
+- **Errors** (`errors.Is`):
+
+  | Error | Meaning |
+  |---|---|
+  | `ErrNotLinked` | no user found or created |
+  | `ErrNotAllowed` | wrong org, or the org does not offer the IdP |
+  | `ErrAccessDenied` | no project grant |
+  | `ErrUserInactive` | user deactivated or locked |
+  | `ErrMFARequired` | org forces MFA for external logins |
+  | `ErrAuthRequestExpired` | auth request expired or already handled |
+  | `ErrIntentFailed` | cancelled at the IdP |
+  | `oidcauth.ErrInvalidState` | unknown or used ticket |
+  | `*zitadel.APIError` | other API failures |
+
+  `zitadel.IsUserError` separates refusals from an unavailable Zitadel.
+- **Why server-side authorize**: with `LoginV2.Required` on the instance,
+  Zitadel ignores the per-app Login V2 base URI, so the app cannot be
+  registered as the login UI.
+- `zitadeltest` is a fake of the v2 API on top of `oidctest`, for end-to-end
+  tests.
 
 ## Testing
 
