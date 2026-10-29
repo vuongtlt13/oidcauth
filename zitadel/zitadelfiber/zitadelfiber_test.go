@@ -195,6 +195,37 @@ func TestAutoCreates(t *testing.T) {
 	}
 }
 
+func TestAutoCreatesWithMissingNames(t *testing.T) {
+	for name, tc := range map[string]struct {
+		given, family string
+		want          [2]string
+	}{
+		"no family name": {"An", "", [2]string{"An", "An"}},
+		"no given name":  {"", "Nguyen", [2]string{"Nguyen", "Nguyen"}},
+		"no names":       {"", " ", [2]string{"new", "new"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.fake.IsAutoCreation = true
+			e.fake.External = zitadeltest.External{ID: "g-1", Email: "new@gmail.com", Verified: true, GivenName: tc.given, FamilyName: tc.family}
+
+			if loc := e.login(t, "/"); loc.String() != "/" {
+				t.Fatalf("redirect = %s, err = %v", loc, e.err)
+			}
+			if len(e.fake.Created) != 1 {
+				t.Fatalf("created = %v", e.fake.Created)
+			}
+			profile := e.fake.Created[0]["human"].(map[string]any)["profile"].(map[string]any)
+			if got := [2]string{profile["givenName"].(string), profile["familyName"].(string)}; got != tc.want {
+				t.Fatalf("names = %v, want %v", got, tc.want)
+			}
+			if e.fake.SessionUser != zitadeltest.NewUserID {
+				t.Fatalf("session user = %q", e.fake.SessionUser)
+			}
+		})
+	}
+}
+
 func TestRefusals(t *testing.T) {
 	cases := map[string]struct {
 		setup func(*zitadeltest.Server)
@@ -242,13 +273,6 @@ func TestRefusals(t *testing.T) {
 				f.External = zitadeltest.External{ID: "g-1", LinkedTo: "u1"}
 			},
 			want: zitadel.ErrNotAllowed,
-		},
-		"auto-create without names": {
-			setup: func(f *zitadeltest.Server) {
-				f.IsAutoCreation = true
-				f.External = zitadeltest.External{ID: "g-1", Email: "a@gmail.com", Verified: true}
-			},
-			want: zitadel.ErrNotLinked,
 		},
 		"inactive user": {
 			setup: func(f *zitadeltest.Server) {

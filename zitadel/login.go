@@ -2,9 +2,11 @@ package zitadel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // Errors of IDPLogin.Finish. Zitadel API errors are returned as *APIError.
@@ -189,16 +191,16 @@ func (l *IDPLogin) resolveUser(ctx context.Context, intent *Intent, orgID string
 	}
 
 	if opts.IsAutoCreation && newUser != nil {
-		// CreateUser requires both names; the login UI asks for missing ones.
-		if newUser.Human.Profile.GivenName == "" || newUser.Human.Profile.FamilyName == "" {
-			return nil, fmt.Errorf("%w: %s, auto-creation needs given and family name", ErrNotLinked, reason)
+		request := withNames(intent.CreateUser)
+		if request == nil {
+			return nil, fmt.Errorf("%w: %s, auto-creation needs a name", ErrNotLinked, reason)
 		}
 		if orgID == "" {
 			if orgID, err = l.api.DefaultOrgID(ctx); err != nil {
 				return nil, err
 			}
 		}
-		id, err := l.api.CreateUser(ctx, orgID, intent.CreateUser)
+		id, err := l.api.CreateUser(ctx, orgID, request)
 		if err != nil {
 			return nil, err
 		}
@@ -226,6 +228,56 @@ func (l *IDPLogin) checkLinkingAllowed(ctx context.Context, orgID string) error 
 			ErrNotAllowed, orgID, l.idpID, ids)
 	}
 	return nil
+}
+
+// withNames returns createUser with both names, which CreateUser requires
+// (the login UI asks for missing ones). Many accounts lack one, e.g. Google
+// accounts with a single name: a missing name takes the other, else the
+// display name, else the email's local part, else the username. nil when
+// there is nothing to use.
+func withNames(createUser json.RawMessage) json.RawMessage {
+	var request map[string]any
+	if json.Unmarshal(createUser, &request) != nil {
+		return nil
+	}
+	human, ok := request["human"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	profile, ok := human["profile"].(map[string]any)
+	if !ok {
+		profile = map[string]any{}
+		human["profile"] = profile
+	}
+	text := func(v any) string {
+		s, _ := v.(string)
+		return strings.TrimSpace(s)
+	}
+	email, _ := human["email"].(map[string]any)
+	local, _, _ := strings.Cut(text(email["email"]), "@")
+	name := ""
+	for _, v := range []string{
+		text(profile["givenName"]), text(profile["familyName"]), text(profile["displayName"]),
+		local, text(request["username"]),
+	} {
+		if v != "" {
+			name = v
+			break
+		}
+	}
+	if name == "" {
+		return nil
+	}
+	for _, key := range []string{"givenName", "familyName"} {
+		if text(profile[key]) == "" {
+			profile[key] = name
+		}
+	}
+	out, err := json.Marshal(request)
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 func authRequestError(err error) error {
