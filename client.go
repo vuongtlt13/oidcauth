@@ -33,6 +33,9 @@ var (
 	// ErrNotSupported means the provider does not advertise the endpoint the
 	// operation needs (revocation, end session).
 	ErrNotSupported = errors.New("oidcauth: not supported by the provider")
+	// ErrVerifyOnly means a browser login was started or finished on a client
+	// configured with Config.VerifyOnly.
+	ErrVerifyOnly = errors.New("oidcauth: client only verifies ID tokens")
 )
 
 // ProviderError is an error returned by the provider at the callback
