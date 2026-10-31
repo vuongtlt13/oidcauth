@@ -56,6 +56,11 @@ type Config struct {
 	TokenEndpointAuthMethod string
 	// RedirectURL is the absolute callback URL registered at the provider.
 	RedirectURL string
+	// VerifyOnly makes a client that only verifies ID tokens obtained
+	// elsewhere (VerifyIDToken), e.g. Sign in with Apple from a native app.
+	// RedirectURL and CookieSecret are then not required, and Start/Finish
+	// return ErrVerifyOnly.
+	VerifyOnly bool
 	// Scopes requested at the authorization endpoint. Defaults to
 	// DefaultScopes. Must include ScopeOpenID.
 	Scopes []string
@@ -142,10 +147,12 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.ClientID) == "" {
 		errs = append(errs, errors.New("client id is required"))
 	}
-	if err := validateAbsoluteURL("redirect url", c.RedirectURL); err != nil {
-		errs = append(errs, err)
+	if !c.VerifyOnly || c.RedirectURL != "" {
+		if err := validateAbsoluteURL("redirect url", c.RedirectURL); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if len(c.CookieSecret) < minCookieSecret {
+	if !c.VerifyOnly && len(c.CookieSecret) < minCookieSecret {
 		errs = append(errs, fmt.Errorf("cookie secret must be at least %d characters", minCookieSecret))
 	}
 	if len(c.Scopes) > 0 && !containsString(c.Scopes, ScopeOpenID) {

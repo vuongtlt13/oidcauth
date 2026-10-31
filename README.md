@@ -33,6 +33,8 @@ rewrites:
   **userinfo**.
 - RP-initiated logout (`LogoutURL`) and **back-channel logout** token
   verification (`VerifyLogoutToken`).
+- **ID tokens from native apps** (`VerifyIDToken`): a mobile app logs in
+  itself (or with Sign in with Apple) and the backend verifies its ID token.
 - Client authentication: `client_secret_basic`, `client_secret_post`,
   `private_key_jwt` and `none` (public client + PKCE).
 - A **Fiber v2 adapter** (`oidcfiber`) and an in-process **fake provider**
@@ -122,6 +124,7 @@ and the cookie value back in.
 | OIDC Core §5.1 standard claims, §5.4 scope claims, §5.5 claims request | yes |
 | OIDC Core §5.3 UserInfo | merged at login (`SkipUserInfo` disables it); `sub` must match the ID token |
 | OIDC Core §9 client authentication | `client_secret_basic`, `client_secret_post`, `private_key_jwt`, `none` |
+| OIDC Core §3.1.3.7 for tokens obtained elsewhere | `VerifyIDToken` (`aud` of another client, `nonce`, max age, `at_hash`) |
 | OIDC Core §12 refresh tokens | `Refresh`; the refreshed ID token is verified |
 | OAuth 2.0 Form Post Response Mode | `WithResponseMode(ResponseModeFormPost)` |
 | RFC 9207 `iss` authorization response parameter | checked when present |
@@ -168,6 +171,42 @@ claims, err := client.UserInfo(ctx, accessToken, identity.Subject)
 Most apps do not need these. They are for apps that call provider APIs on
 behalf of the user, or that want to tie their own session lifetime to the
 provider grant.
+
+## ID tokens from native apps
+
+A mobile or desktop app logs in itself (authorization code + PKCE in the
+system browser, as a public client, or Sign in with Apple) and sends its ID
+token to the backend, which verifies it and issues its own session:
+
+```go
+identity, err := client.VerifyIDToken(ctx, idToken,
+	oidcauth.WithAccessToken(accessToken),   // optional: checks at_hash, merges userinfo
+	oidcauth.WithAudience("native-app-client"), // the app's client id; default Config.ClientID
+	oidcauth.WithNonce(nonce),               // optional: when the app sends its nonce
+	oidcauth.WithTokenMaxAge(5*time.Minute), // optional: refuse older tokens (now - iat)
+)
+```
+
+It checks the signature, `iss`, `aud`, `azp`, `exp` and `iat` like a browser
+login; an invalid token is an `IsUserError`. The app's client may belong to
+another project of the same provider: only the issuer must match. An ID
+token is a bearer proof of the login, so keep the max age short and the
+transport on HTTPS.
+
+A provider used only this way needs no redirect URL or cookie secret: set
+`VerifyOnly`. For Sign in with Apple:
+
+```go
+apple, _ := oidcauth.New(oidcauth.Config{
+	Issuer:     "https://appleid.apple.com",
+	ClientID:   "com.example.app", // the bundle id, the `aud` of the token
+	VerifyOnly: true,              // Start/Finish return ErrVerifyOnly
+})
+identity, err := apple.VerifyIDToken(ctx, credential.IdentityToken, oidcauth.WithTokenMaxAge(10*time.Minute))
+```
+
+Apple sends the name only to the app, at the first authorization: have the
+app pass it along.
 
 ## Logout
 

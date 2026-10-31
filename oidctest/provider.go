@@ -267,6 +267,11 @@ func (p *Provider) LogoutToken(sub, sid string, mutate func(map[string]any)) str
 	return p.signTyped(claims, "logout+jwt")
 }
 
+// Sign signs claims as an ID token with the provider key, e.g. one a native
+// app obtained itself, for VerifyIDToken tests. The claims are used as given:
+// set iss, sub, aud, iat and exp.
+func (p *Provider) Sign(claims map[string]any) string { return p.signTyped(claims, "JWT") }
+
 func (p *Provider) discovery(w http.ResponseWriter, _ *http.Request) {
 	base := p.Server.URL
 	writeJSON(w, map[string]any{

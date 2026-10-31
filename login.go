@@ -151,6 +151,9 @@ func (c *Client) requestedScopes(o *loginOptions) []string {
 // Start begins a login. The caller must set the returned cookie on the
 // response and redirect the browser to authURL.
 func (c *Client) Start(ctx context.Context, opts ...LoginOption) (authURL string, cookie *http.Cookie, err error) {
+	if c.cfg.VerifyOnly {
+		return "", nil, ErrVerifyOnly
+	}
 	var o loginOptions
 	for _, opt := range opts {
 		opt(&o)
@@ -255,6 +258,9 @@ type Result struct {
 // checks auth_time when max_age was requested and acr when Config.RequireACR
 // is set, and, unless SkipUserInfo is set, merges userinfo claims.
 func (c *Client) Finish(ctx context.Context, params url.Values, cookieValue string) (*Result, error) {
+	if c.cfg.VerifyOnly {
+		return nil, ErrVerifyOnly
+	}
 	state := params.Get("state")
 	if state == "" || cookieValue == "" {
 		return nil, ErrInvalidState
